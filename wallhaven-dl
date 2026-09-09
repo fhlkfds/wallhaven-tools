@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly API_URL="https://wallhaven.cc/api/v1/search"
+readonly DEFAULT_OUTPUT_DIR="${HOME}/Pictures/wallpapers/wallhaven"
+readonly API_DELAY_SECONDS=2
+readonly IMAGE_DELAY_SECONDS=0.25
+readonly MAX_429_RETRIES=3
+
+declare -A api_params=()
+query=""
+output_dir="$DEFAULT_OUTPUT_DIR"
+page_limit=0
+source_url=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  wallhaven-dl -q QUERY [-o DIR] [--res RESOLUTION] [--atleast RESOLUTION]
+               [--page-limit N] [--param KEY=VALUE ...]
+  wallhaven-dl WALLHAVEN_SEARCH_URL [-o DIR] [--page-limit N]
+
+Options:
+  -q, --query QUERY       Search terms.
+  -o, --output DIR        Download directory.
+                         Default: ~/Pictures/wallpapers/wallhaven
+      --res RESOLUTION   Exact resolution filter, for example 1920x1080.
+      --atleast VALUE     Minimum resolution, for example 1080p.
+      --page-limit N      Stop after N API pages.
+      --param KEY=VALUE   Pass another public search parameter to the API.
+  -h, --help              Show this help.
+
+Safety:
+  Every request forces purity=100 (SFW). API keys and purity overrides are
+  rejected.
+EOF
+}
+
+die() {
+  printf 'wallhaven-dl: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+url_decode() {
+  local encoded=${1//+/ }
+  local decoded="" prefix hex suffix byte
+
+  while [[ $encoded =~ ^([^%]*)%([[:xdigit:]]{2})(.*)$ ]]; do
+    prefix=${BASH_REMATCH[1]}
+    hex=${BASH_REMATCH[2]}
+    suffix=${BASH_REMATCH[3]}
+    printf -v byte '%b' "\\x${hex}"
+    decoded+="${prefix}${byte}"
+    encoded=$suffix
+  done
+
+  printf '%s%s' "$decoded" "$encoded"
+}
+
+normalize_param_name() {
+  case $1 in
+    top-range) printf '%s' 'topRange' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+set_extra_param() {
+  local pair=$1 key value
+  [[ $pair == *=* ]] || die "--param expects KEY=VALUE: $pair"
+  key=$(normalize_param_name "${pair%%=*}")
+  value=${pair#*=}
+  [[ $key =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || die "invalid API parameter name: $key"
+
+  case ${key,,} in
+    apikey|api_key) die "API keys are not supported" ;;
+    purity) die "purity is fixed to 100 (SFW only)" ;;
+    page) die "page is controlled by the downloader" ;;
+  esac
+
+  api_params["$key"]=$value
+}
+
+parse_search_url() {
+  local url=$1 route query_string pair raw_key raw_value key value
+  [[ $url =~ ^https://(www\.)?wallhaven\.cc/(search|latest|hot|toplist)(\?|$) ]] ||
+    die "expected an https://wallhaven.cc search, latest, hot, or toplist URL"
+
+  route=${BASH_REMATCH[2]}
+  query_string=${url#*\?}
+  if [[ $query_string != "$url" ]]; then
+    query_string=${query_string%%#*}
+    IFS='&' read -r -a pairs <<< "$query_string"
+    for pair in "${pairs[@]}"; do
+      [[ -n $pair ]] || continue
+      raw_key=${pair%%=*}
+      raw_value=""
+      [[ $pair == *=* ]] && raw_value=${pair#*=}
+      key=$(url_decode "$raw_key")
+      value=$(url_decode "$raw_value")
+
+      case ${key,,} in
+        apikey|api_key|purity|page) continue ;;
+      esac
+      [[ $key =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || continue
+      api_params["$key"]=$value
+    done
+  fi
+
+  case $route in
+    search)
+      [[ -v 'api_params[sorting]' ]] || api_params[sorting]=relevance
+      ;;
+    latest)
+      [[ -v 'api_params[sorting]' ]] || api_params[sorting]=date_added
+      [[ -v 'api_params[order]' ]] || api_params[order]=desc
+      ;;
+    hot)
+      [[ -v 'api_params[sorting]' ]] || api_params[sorting]=hot
+      [[ -v 'api_params[order]' ]] || api_params[order]=desc
+      ;;
+    toplist)
+      [[ -v 'api_params[sorting]' ]] || api_params[sorting]=toplist
+      [[ -v 'api_params[order]' ]] || api_params[order]=desc
+      [[ -v 'api_params[topRange]' ]] || api_params[topRange]=1M
+      ;;
+  esac
+}
+
+while (($#)); do
+  case $1 in
+    -q|--query)
+      (($# >= 2)) || die "$1 requires a value"
+      query=$2
+      shift 2
+      ;;
+    -o|--output)
+      (($# >= 2)) || die "$1 requires a value"
+      output_dir=$2
+      shift 2
+      ;;
+    --res)
+      (($# >= 2)) || die "$1 requires a value"
+      api_params[resolutions]=$2
+      shift 2
+      ;;
+    --atleast)
+      (($# >= 2)) || die "$1 requires a value"
+      api_params[atleast]=$2
+      shift 2
+      ;;
+    --page-limit)
+      (($# >= 2)) || die "$1 requires a value"
+      [[ $2 =~ ^[1-9][0-9]*$ ]] || die "--page-limit must be a positive integer"
+      page_limit=$2
+      shift 2
+      ;;
+    --param)
+      (($# >= 2)) || die "$1 requires KEY=VALUE"
+      set_extra_param "$2"
+      shift 2
+      ;;
+    --param=*)
+      set_extra_param "${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      [[ -z $source_url ]] || die "only one Wallhaven URL may be supplied"
+      source_url=$1
+      shift
+      ;;
+  esac
+done
+
+(($# == 0)) || die "unexpected argument: $1"
+[[ -z $source_url || -z $query ]] || die "use either -q or a Wallhaven URL, not both"
+
+require_command curl
+require_command jq
+
+if [[ -n $source_url ]]; then
+  parse_search_url "$source_url"
+elif [[ -n $query ]]; then
+  api_params[q]=$query
+  [[ -v 'api_params[sorting]' ]] || api_params[sorting]=relevance
+else
+  die "provide -q QUERY or a full Wallhaven search URL"
+fi
+
+api_params[purity]=100
+mkdir -p "$output_dir"
+
+work_dir=$(mktemp -d)
+trap 'rm -rf -- "$work_dir"' EXIT
+response_file="$work_dir/response.json"
+
+fetch_page() {
+  local page=$1 attempt=0 backoff=30 http_code curl_status
+  local -a curl_args=(
+    --fail-with-body
+    --location
+    --silent
+    --show-error
+    --retry 2
+    --retry-delay 1
+    --retry-max-time 15
+    --output "$response_file"
+    --write-out '%{http_code}'
+    --get
+  )
+  local key
+
+  for key in "${!api_params[@]}"; do
+    curl_args+=(--data-urlencode "${key}=${api_params[$key]}")
+  done
+  curl_args+=(--data-urlencode "page=${page}")
+
+  while :; do
+    curl_status=0
+    http_code=$(curl "${curl_args[@]}" "$API_URL") || curl_status=$?
+
+    if [[ $http_code == 429 ]]; then
+      if ((attempt >= MAX_429_RETRIES)); then
+        die "API rate limit persisted after ${MAX_429_RETRIES} retries"
+      fi
+      printf 'Rate limited (HTTP 429); retrying in %d seconds...\n' "$backoff" >&2
+      sleep "$backoff"
+      ((attempt += 1))
+      ((backoff *= 2))
+      continue
+    fi
+
+    ((curl_status == 0)) || die "API request failed (curl $curl_status, HTTP $http_code)"
+    [[ $http_code =~ ^2[0-9][0-9]$ ]] || die "API returned HTTP $http_code"
+    jq -e '.data | type == "array"' "$response_file" >/dev/null ||
+      die "API response did not contain a data array"
+    return
+  done
+}
+
+page=1
+downloaded=0
+skipped=0
+
+while :; do
+  printf 'Fetching API page %d...\n' "$page"
+  fetch_page "$page"
+
+  if jq -e '[.data[].purity] | any(. != "sfw")' "$response_file" >/dev/null; then
+    die "API returned a non-SFW result; refusing the page"
+  fi
+
+  result_count=$(jq '.data | length' "$response_file")
+  last_page=$(jq -r '.meta.last_page // empty' "$response_file")
+  printf 'Page %d: %d result(s)\n' "$page" "$result_count"
+
+  item_number=0
+  while IFS=$'\t' read -r image_id image_url; do
+    [[ -n $image_id && -n $image_url ]] || continue
+    ((item_number += 1))
+    clean_url=${image_url%%\?*}
+    filename=${clean_url##*/}
+    [[ $filename =~ ^wallhaven-[A-Za-z0-9]+\.[A-Za-z0-9]+$ ]] ||
+      die "unexpected image filename for $image_id: $filename"
+    destination="$output_dir/$filename"
+
+    if [[ -f $destination ]]; then
+      printf '[%d/%d] skip %s (already downloaded)\n' "$item_number" "$result_count" "$filename"
+      ((skipped += 1))
+      continue
+    fi
+
+    printf '[%d/%d] download %s\n' "$item_number" "$result_count" "$filename"
+    partial="$work_dir/$filename.part"
+    curl --fail --location --silent --show-error --retry 2 \
+      --output "$partial" "$image_url"
+    mv -- "$partial" "$destination"
+    ((downloaded += 1))
+    sleep "$IMAGE_DELAY_SECONDS"
+  done < <(jq -r '.data[] | [.id, .path] | @tsv' "$response_file")
+
+  if ((result_count == 0)); then
+    break
+  fi
+  if ((page_limit > 0 && page >= page_limit)); then
+    break
+  fi
+  if [[ $last_page =~ ^[0-9]+$ ]] && ((page >= last_page)); then
+    break
+  fi
+  if ((result_count < 24)); then
+    printf 'Page %d was short but metadata reports more pages; continuing.\n' "$page" >&2
+  fi
+
+  ((page += 1))
+  sleep "$API_DELAY_SECONDS"
+done
+
+printf 'Done: %d downloaded, %d skipped; output: %s\n' \
+  "$downloaded" "$skipped" "$output_dir"
